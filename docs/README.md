@@ -94,7 +94,7 @@ graph TD
     WstComp -->|enqueue input events| EventQ
     EventQ -->|drain and dispatch| CompThread
     CompThread -->|surface commit and compose| RendGL
-    CompThread -->|output keyboard VPC callbacks| NCThread
+    NCThread -->|output keyboard VPC callbacks| CompThread
     RendGL -->|EGL GLES2 DMA-buf| SOC
     NCThread -->|nested wl events| CompThread
 ```
@@ -343,7 +343,7 @@ The HAL boundary for Westeros is the renderer module interface. All functions be
   - Core lifecycle: `westeros-compositor.cpp` — `WstCompositorCreate`, `WstCompositorStart`, `WstCompositorStop`, `WstCompositorDestroy`
   - Compositor thread body: `westeros-compositor.cpp` — `wstCompositorThread`
 
-- **Event Processing**: Input events injected by the host application are written into `WstCompositor::eventQueue[WST_EVENT_QUEUE_SIZE]` (64 entries, ring buffer indexed by `eventIndex`). The compositor thread calls `wstCompositorProcessEvents` on each loop iteration, draining the queue and dispatching each event type to the matching handler (`wstProcessKeyEvent`, `wstProcessPointerMoveEvent`, `wstProcessTouchDownEvent`, etc.). Each handler locates the appropriate focused surface via `WstKeyboard::focus`, `WstPointer::focus`, or `WstTouch::focus` and sends the corresponding Wayland protocol event to the client's resource list.
+- **Event Processing**: Input events injected by the host application are written into `WstCompositor::eventQueue[WST_EVENT_QUEUE_SIZE]` (64 entries, a fixed batch indexed by `eventIndex`). The compositor thread calls `wstCompositorProcessEvents` on each loop iteration, draining the queue and dispatching each event type to the matching handler (`wstProcessKeyEvent`, `wstProcessPointerMoveEvent`, `wstProcessTouchDownEvent`, etc.). Each handler locates the appropriate focused surface via `WstKeyboard::focus`, `WstPointer::focus`, or `WstTouch::focus` and sends the corresponding Wayland protocol event to the client's resource list.
 
 - **Error Handling Strategy**: API functions return `bool` (true on success). On failure, a descriptive string is stored in `WstCompositor::lastErrorDetail` and retrieved with `WstCompositorGetLastErrorDetail`. Renderer `dlopen` and `renderer_init` failures abort `WstCompositorStart`. Nested connection loss sets `compositorAborted`, which terminates the compositor thread cleanly.
 
