@@ -40,12 +40,12 @@ classDef VL stroke:#808080,fill:#F2F2F2,stroke-width:2px
 
 - **Multiple Compositor Modes**: Westeros operates as a normal (top-level), nested, or embedded compositor. A nested compositor connects to a parent Wayland display and forwards its composited output as a client surface; an embedded compositor exposes its scene only when the host application triggers composition explicitly via `WstCompositorComposeEmbedded`.
 - **Pluggable Renderer Interface**: The rendering backend is loaded at runtime from a shared library specified by `WstCompositorSetRendererModule`. Renderer modules implement a defined function table (`WstRenderer`) covering surface create/destroy, buffer commit, geometry, opacity, z-order, crop, and DMA-buf operations.
-- **Surface and Shell Protocol Support**: Westeros implements `wl_compositor`, `wl_shell`, and `xdg_shell` (versions 4, 5, and stable) server-side protocols. Each client surface is tracked as a `WstSurface` with full position, size, opacity, z-order, and popup relationship state.
+- **Surface and Shell Protocol Support**: Westeros implements `wl_compositor`, `wl_shell`, and one build-selected `xdg-shell` variant (v4, v5, or stable) server-side. Each client surface is tracked as a `WstSurface` with full position, size, opacity, z-order, and popup relationship state.
 - **Input Routing**: Keyboard, pointer, and touch input is injected via the compositor API (`WstCompositorKeyEvent`, `WstCompositorPointerMoveEvent`, `WstCompositorPointerButtonEvent`, `WstCompositorTouchEvent`) and dispatched through standard Wayland seat protocols to the focused surface. Keyboard layout is managed via libxkbcommon with configurable key repeat delay and rate.
 - **Video Path Control (VPC)**: The proprietary `vpc` Wayland protocol extension allows a video surface to declare whether its content follows a hardware or graphics path and communicates position and scale transforms to the compositor chain, enabling hole-punch and hardware video overlay positioning.
 - **Wayland Protocol Extensions**: Optionally compiled-in extensions include `wl_sb` (shared buffer), `zwp_linux_dmabuf_v1` (DMA-buf import), `linux_explicit_synchronization_unstable_v1` (acquire/release fence synchronization), and `wl_simple_shell` for privileged surface management.
 - **Extensible Module System**: Additional Wayland protocols or functionality can be added at runtime by loading external shared libraries that provide `moduleInit` and `moduleTerm` entry points, registered via `WstCompositorAddModule`.
-- **Repeater Mode**: A repeating nested compositor forwards client surface buffers directly to the parent compositor without performing intermediate composition rendering, minimizing latency in layered compositor configurations.
+- **Repeater Mode**: When supported by the platform's Wayland-EGL path, a repeating nested compositor forwards client surface buffers directly to the parent compositor without intermediate composition; otherwise Westeros falls back to nested composition with the GL renderer.
 - **Virtual Embedded Compositors**: Multiple virtual embedded compositor instances can be created from a single master embedded compositor via `WstCompositorCreateVirtualEmbedded`, allowing independent sub-scene management within one process.
 
 ---
@@ -58,9 +58,9 @@ The three compositor modes — normal, nested, and embedded — are controlled b
 
 Rendering is fully decoupled through the `WstRenderer` interface: the compositor calls `renderer_init` in the loaded module to populate a function table, then calls `surfaceCreate`, `surfaceCommit`, `updateScene`, and related methods for each frame. This separation means the compositor core has no dependency on any specific GPU API; EGL and GLES2 are engaged only when a GL-based renderer module is loaded. Buffer sharing between clients and the renderer is handled through `wl_shm`, `wl_sb`, `zwp_linux_dmabuf_v1`, or EGL Wayland buffer extensions, depending on which protocols are enabled at build time.
 
-Northbound interaction is entirely via the Wayland socket protocol: clients connect, bind globals, create surfaces, attach buffers, and commit. Southbound interaction is through the renderer module's function table, which abstracts the vendor-specific GPU and display path. Westeros operates as a standalone process-level service accessed exclusively over the Wayland socket.
+Northbound interaction with hosted clients is via the Wayland socket protocol: clients connect, bind globals, create surfaces, attach buffers, and commit. The hosting application also controls embedded instances through the C API, while southbound interaction is through the renderer module's function table.
 
-The keyboard map is initialized from libxkbcommon on each compositor startup using the evdev rule set and the us layout by default. All operational state is managed entirely in process memory.
+For non-nested starts, the keyboard map is initialized from libxkbcommon using the evdev rule set and the us layout by default; nested instances receive the parent compositor's keymap.
 
 ```mermaid
 graph TD
@@ -105,9 +105,9 @@ graph TD
 - **Main / Caller Thread**: Invokes `WstCompositorCreate`, `WstCompositorSet*`, `WstCompositorStart`, and input injection APIs. Posts events to the per-compositor event queue.
 - **Worker Threads**:
   - _Compositor thread_ (`wstCompositorThread`): Runs the `wl_display` event loop, accepts client connections, dispatches protocol requests, schedules repaints, drives frame composition at the configured frame rate, and manages surface lifecycle.
-  - _Nested connection thread_: Active in nested or repeater mode. Maintains the Wayland client connection to the parent compositor, receives output geometry, keyboard map, and VPC notifications, and posts them into the compositor context.
+  - _Nested connection thread_: Active in nested, repeater, or embedded VPC-bridge mode. Maintains the Wayland client connection to the parent compositor, receives output geometry, keyboard map, and VPC notifications, and posts them into the compositor context.
 - **Synchronization**: A recursive pthread mutex (`ctx->mutex`) protects the compositor context and surface/client maps. A mutex and condition variable pair (`ncStartedMutex`, `ncStartedCond`) synchronizes the start of the nested connection thread with the compositor thread startup. The master embedded compositor uses a separate global mutex (`g_mutexMasterEmbedded`).
-- **Async / Event Dispatch**: Input injection APIs write into the `WstCompositor::eventQueue` ring buffer (64 entries, indexed by `eventIndex`). The compositor thread calls `wstCompositorProcessEvents` on each loop iteration, draining the queue and dispatching each event type to the matching handler (`wstProcessKeyEvent`, `wstProcessPointerMoveEvent`, `wstProcessTouchDownEvent`, etc.).
+- **Async / Event Dispatch**: Input injection APIs append to the fixed 64-entry `WstCompositor::eventQueue`, indexed by `eventIndex`; `wstCompositorProcessEvents` drains the batch and resets the index. It dispatches each event type to the matching handler (`wstProcessKeyEvent`, `wstProcessPointerMoveEvent`, `wstProcessTouchDownEvent`, etc.).
 
 ### Prerequisites and Dependencies
 
@@ -125,7 +125,7 @@ graph TD
 
 #### Initialization to Active State
 
-The compositor transitions through the following states during its lifecycle: **Uninitialized** (before `WstCompositorCreate`) → **Configured** (`WstCompositorSet*` calls establish display name, renderer module, frame rate, and mode flags) → **Starting** (`WstCompositorStart` spawns the compositor thread) → **Ready** (compositor thread creates the `wl_display`, initializes renderer, seat, output, and shell globals, then signals readiness) → **Active** (compositor thread runs the event loop, accepting client connections and generating frames) → **Shutdown** (`WstCompositorStop` signals the compositor thread to exit, renderer and seat resources are released).
+The compositor transitions through the following states during its lifecycle: **Uninitialized** (before `WstCompositorCreate`) → **Configured** (`WstCompositorSet*` calls establish display name, renderer module, frame rate, and mode flags) → **Starting** (`WstCompositorStart` spawns the compositor thread) → **Ready** (the compositor thread has created the Wayland display, seat, output, and shell globals; embedded mode initializes its renderer immediately after this signal in `WstCompositorStart`) → **Active** (the compositor thread runs the event loop, accepting client connections and generating frames) → **Shutdown** (`WstCompositorStop` signals the compositor thread to exit, renderer and seat resources are released).
 
 ```mermaid
 sequenceDiagram
@@ -166,8 +166,8 @@ sequenceDiagram
 **State Change Triggers:**
 
 - **Output Size Change**: `WstCompositorSetOutputSize` or `WstCompositorResolutionChangeEnd` set `outputSizeChanged` flags; the compositor thread calls `wstOutputChangeSize` on its next iteration, updating all clients with a new `wl_output.mode` event.
-- **Nested Connection Loss**: When the nested connection thread detects that the parent compositor has disconnected, it invokes the `connectionEnded` callback on the compositor context, which sets `compositorAborted` and causes the compositor thread to stop cleanly.
-- **First Frame Notification**: When a client surface receives its first committed buffer, the `clientStatusCB` is invoked with `WstClient_firstFrame`, allowing the host application to respond to content availability.
+- **Nested Connection Loss**: When the nested connection thread detects that the parent compositor has disconnected, it terminates the local Wayland display and invokes the configured termination callback; the compositor thread then exits its event loop and releases resources.
+- **First Frame Notification**: During embedded composition, after a non-hidden scene containing a client's committed buffer is composed, `clientStatusCB` is invoked with `WstClient_firstFrame` once for that client PID.
 
 **Context Switching Scenarios:**
 
@@ -365,16 +365,15 @@ The HAL boundary for Westeros is the renderer module interface. All functions be
 | `WESTEROS_GL_USE_REFRESH_LOCK`  | int    | —           | When set to `1`, instructs the GL renderer to synchronise frame generation to display refresh.                        |
 | `WESTEROS_VPC_BRIDGE`           | string | —           | Display name of a compositor to establish a VPC bridge with, used by embedded compositors.                            |
 | `WESTEROS_RENDER_GL_FPS`        | —      | —           | Enables frame-rate reporting in the GL renderer module.                                                               |
-| `WESTEROS_FAST_RENDER`          | —      | —           | Enables the fast-render optimisation path in the compositor.                                                          |
+| `WESTEROS_FAST_RENDER`          | string | —           | For embedded composition, names a fast-render shared library implementing `delegateUpdateScene`.                  |
 
 ### Runtime Configuration
 
-The `westeros-init` script selects the renderer module before launching the compositor. The renderer and launch parameters can be overridden by modifying `/etc/default/westeros-env` and restarting the `westeros.service` unit:
+The `westeros-init` script selects the renderer module before launching the compositor. Its `RENDERER` assignment overrides any value from `/etc/default/westeros-env`, so change the init script or invoke `westeros` directly when selecting a renderer.
 
-```bash
-echo 'RENDERER="/usr/lib/libwesteros_render_gl.so.0"' >> /etc/default/westeros-env
+To apply supported environment-file changes:
+
 systemctl restart westeros
-```
 
 The frame rate and display name can also be passed on the command line when invoking the `westeros` binary directly:
 
